@@ -85,5 +85,6 @@ TODO: Propose an upstream Ceph docs update for `GET /admin/user?list`
 `marker`; needs `users=read`), which exists since Nautilus but isn't in the
 Admin Ops docs.
 
-TODO: Consider a Go rewrite on [go-ceph `rgw/admin`](https://pkg.go.dev/github.com/ceph/go-ceph/rgw/admin)
-and [gophercloud](https://github.com/gophercloud/gophercloud), both maintained upstream.
+TODO: Go rewrite on [go-ceph `rgw/admin`](https://pkg.go.dev/github.com/ceph/go-ceph/rgw/admin)
+and [gophercloud](https://github.com/gophercloud/gophercloud), both maintained upstream,
+with quotas from Keystone unified limits. See [go/HANDOFF.md](go/HANDOFF.md).
