@@ -134,9 +134,7 @@ def test_set_quota_sends_json_body():
         f"{ENDPOINT}/admin/user?quota&format=json&uid=abc%24abc&quota-type=user"
     )
     assert json.loads(request.data) == QUOTA
-    assert request.headers["x-amz-content-sha256"] == (
-        hashlib.sha256(request.data).hexdigest()
-    )
+    assert request.headers["x-amz-content-sha256"] == "UNSIGNED-PAYLOAD"
 
 
 def test_missing_user_raises_no_such_user():

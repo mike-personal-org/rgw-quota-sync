@@ -139,7 +139,7 @@ class RGW:
             self.host,
             "/admin/user",
             canonical_query,
-            hashlib.sha256(body).hexdigest(),
+            "UNSIGNED-PAYLOAD",  # Reef answers 501 to a signed body on Admin Ops calls
             self.access_key,
             self.secret_key,
             datetime.now(UTC),
