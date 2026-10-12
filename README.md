@@ -114,4 +114,5 @@ Admin Ops docs. Also note that Set User Quota's JSON body must be sent as
 
 TODO: Go rewrite on [go-ceph `rgw/admin`](https://pkg.go.dev/github.com/ceph/go-ceph/rgw/admin)
 and [gophercloud](https://github.com/gophercloud/gophercloud), both maintained upstream,
-with quotas from Keystone unified limits. See [go/HANDOFF.md](go/HANDOFF.md).
+with quotas from Keystone unified limits. Handoff notes are on the
+[`go-rewrite`](https://github.com/mike-personal-org/rgw-quota-sync/tree/go-rewrite/go) branch.
