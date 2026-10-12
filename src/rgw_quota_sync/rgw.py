@@ -50,9 +50,7 @@ def sign(
     scope = f"{date}/{REGION}/s3/aws4_request"
 
     canonical_headers = (
-        f"host:{host}\n"
-        f"x-amz-content-sha256:{payload_hash}\n"
-        f"x-amz-date:{timestamp}\n"
+        f"host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{timestamp}\n"
     )
     canonical_request = (
         f"{method}\n"

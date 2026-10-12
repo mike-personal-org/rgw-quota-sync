@@ -19,7 +19,9 @@ from .rgw import RGW, NoSuchUser
 log = logging.getLogger(__name__)
 
 # oslo.log's default format for messages without a request context.
-LOG_FORMAT = "%(asctime)s.%(msecs)03d %(process)d %(levelname)s %(name)s [-] %(message)s"
+LOG_FORMAT = (
+    "%(asctime)s.%(msecs)03d %(process)d %(levelname)s %(name)s [-] %(message)s"
+)
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
@@ -108,9 +110,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    logging.basicConfig(
-        level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT
-    )
+    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
     config = Config.load(args.config)
     rgw = RGW(config.endpoint, config.access_key, config.secret_key)
 

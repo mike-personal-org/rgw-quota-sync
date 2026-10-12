@@ -15,7 +15,12 @@ NOW = datetime(2013, 5, 24, tzinfo=UTC)
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 ENDPOINT = "https://rgw.example.org:8080"
-QUOTA = {"enabled": True, "check_on_raw": False, "max_size": 10995116277760, "max_objects": -1}
+QUOTA = {
+    "enabled": True,
+    "check_on_raw": False,
+    "max_size": 10995116277760,
+    "max_objects": -1,
+}
 
 
 def signature(headers):
@@ -27,7 +32,10 @@ def signature(headers):
     [
         # "GET Bucket Lifecycle" and "GET Bucket (List Objects)" examples from
         # https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
-        ("lifecycle=", "fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543"),
+        (
+            "lifecycle=",
+            "fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543",
+        ),
         (
             "max-keys=2&prefix=J",
             "34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7",
