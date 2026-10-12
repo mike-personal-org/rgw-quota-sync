@@ -1,0 +1,8 @@
+# Allowlist, so a local config.yaml (which holds RGW keys) never enters an image.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!src/
+src/**/__pycache__
+src/*.egg-info

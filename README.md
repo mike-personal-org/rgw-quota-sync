@@ -65,6 +65,17 @@ It ends with how many Keystone users are without an enabled quota, and exits
 `1` if there are any (including users that would be set in a dry run, or that
 couldn't be read), so a dry run also works as a check.
 
+## Container
+
+CI pushes `ghcr.io/mike-personal-org/rgw-quota-sync` for `main` (tag `main`),
+version tags (`v1.2.3` → `1.2.3`) and every commit (`sha-<short sha>`). It runs
+as uid 65534, so pass your own uid to read a `chmod 600` config:
+
+```
+docker run --rm --user "$(id -u)" -v "$PWD/config.yaml:/config.yaml:ro" \
+  ghcr.io/mike-personal-org/rgw-quota-sync:main --config /config.yaml
+```
+
 ## API usage
 
 Requests follow the [Reef Admin Ops docs](https://docs.ceph.com/en/reef/radosgw/adminops/)
