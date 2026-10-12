@@ -1,8 +1,6 @@
-"""Give every RGW user created by Keystone an enabled quota.
+"""Ensure every RGW user has a configured quota.
 
-Users whose quota is disabled get the configured one. Enabled quotas,
-including enabled-unlimited exemptions, are never touched. Exits 1 if any
-Keystone user is left without an enabled quota (in a dry run: would be).
+Updates quotas that differ from the default or per-project override.
 """
 
 import argparse
@@ -32,6 +30,9 @@ class Config:
     secret_key: str = field(repr=False)  # keep it out of logs
     max_size: int  # bytes; -1 = unlimited, 0 blocks all writes
     max_objects: int  # -1 = unlimited, 0 blocks all writes
+    # Keystone project ID (not the RGW uid) -> fields to override,
+    # e.g. {"0123...cdef": {"max_size": -1}}
+    project_quotas: dict[str, dict[str, int]] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str) -> Self:
@@ -40,12 +41,26 @@ class Config:
         # A missing or unknown key raises TypeError.
         return cls(**data)
 
+    def quota_for(self, rgw_uid: str) -> dict[str, int]:
+        """Return the default quota, updated with the user's project override.
+
+        rgw_uid is "<project_id>$<project_id>" (RGW's "<tenant>$<user>"), or
+        just "<project_id>" for users created before
+        rgw_keystone_implicit_tenants.
+        """
+        project_id = rgw_uid.split("$")[0]
+        override = self.project_quotas.get(project_id, {})
+        return {
+            "max_size": override.get("max_size", self.max_size),
+            "max_objects": override.get("max_objects", self.max_objects),
+        }
+
 
 def sync_user(rgw: RGW, uid: str, config: Config, apply: bool) -> bool:
-    """Make sure one RGW user created by Keystone has an enabled quota.
+    """Make sure one RGW user created by Keystone has its configured quota.
 
     Logs what happened. Returns False if the user is, or may be, left without
-    an enabled quota.
+    its configured quota.
     """
     try:
         user = rgw.get_user(uid)
@@ -60,31 +75,37 @@ def sync_user(rgw: RGW, uid: str, config: Config, apply: bool) -> bool:
         log.debug("%s: not a Keystone user, skipped", uid)
         return True
 
-    quota = user["user_quota"]
-    if quota["enabled"]:
+    configured = config.quota_for(uid)
+    current = user["user_quota"]
+    if (
+        current["enabled"]
+        and current["max_size"] == configured["max_size"]
+        and current["max_objects"] == configured["max_objects"]
+    ):
         log.info(
             "%s: quota enabled, unchanged: max_size=%s max_objects=%s",
             uid,
-            quota["max_size"],
-            quota["max_objects"],
+            current["max_size"],
+            current["max_objects"],
         )
         return True
 
     if not apply:
         log.warning(
-            "%s: quota disabled, would set max_size=%s max_objects=%s",
+            "%s: quota %s, would set max_size=%s max_objects=%s",
             uid,
-            config.max_size,
-            config.max_objects,
+            "enabled" if current["enabled"] else "disabled",
+            configured["max_size"],
+            configured["max_objects"],
         )
         return False
 
     new_quota = {
         "enabled": True,
         # The request replaces the whole quota, so keep this setting as it was.
-        "check_on_raw": quota["check_on_raw"],
-        "max_size": config.max_size,
-        "max_objects": config.max_objects,
+        "check_on_raw": current["check_on_raw"],
+        "max_size": configured["max_size"],
+        "max_objects": configured["max_objects"],
     }
     try:
         rgw.set_quota(uid, new_quota)
@@ -94,8 +115,8 @@ def sync_user(rgw: RGW, uid: str, config: Config, apply: bool) -> bool:
     log.info(
         "%s: quota changed: max_size=%s max_objects=%s",
         uid,
-        config.max_size,
-        config.max_objects,
+        configured["max_size"],
+        configured["max_objects"],
     )
     return True
 
@@ -123,9 +144,9 @@ def main(argv: list[str] | None = None) -> None:
             without_quota += 1
 
     if without_quota:
-        log.warning("%d Keystone users without an enabled quota", without_quota)
+        log.warning("%d Keystone users without their configured quota", without_quota)
         sys.exit(1)
-    log.info("all Keystone users have an enabled quota")
+    log.info("all Keystone users have their configured quota")
 
 
 if __name__ == "__main__":

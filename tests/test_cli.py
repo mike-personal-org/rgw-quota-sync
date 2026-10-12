@@ -14,6 +14,15 @@ access_key: access
 secret_key: secret
 max_size: 10995116277760
 max_objects: -1
+project_quotas:  # project IDs, matching the uids in env below
+  big:
+    max_size: 54975581388800  # 50 TiB
+  unlimited:
+    max_size: -1
+  untenanted:
+    max_size: 21990232555520  # 20 TiB
+  objects_only:
+    max_objects: 1000
 """
 
 
@@ -23,6 +32,16 @@ def test_config(tmp_path):
     config = cli.Config.load(str(path))
     assert config.max_size == 10 * TIB
     assert config.max_objects == -1
+    # No override: the default.
+    assert config.quota_for("new$new") == {"max_size": 10 * TIB, "max_objects": -1}
+    assert config.quota_for("big$big") == {"max_size": 50 * TIB, "max_objects": -1}
+    # A uid without "$" is the project ID itself.
+    assert config.quota_for("untenanted") == {"max_size": 20 * TIB, "max_objects": -1}
+    # An override of one field keeps the default for the other.
+    assert config.quota_for("objects_only$objects_only") == {
+        "max_size": 10 * TIB,
+        "max_objects": 1000,
+    }
     assert "secret" not in repr(config)
 
 
@@ -77,8 +96,12 @@ def env(tmp_path, monkeypatch, caplog):
     rgw = FakeRGW(
         {
             "new$new": user("keystone", enabled=False),
-            "own$own": user("keystone", enabled=True, max_size=50 * TIB),
-            "free$free": user("keystone", enabled=True),
+            "big$big": user("keystone", enabled=True, max_size=50 * TIB),
+            "unlimited$unlimited": user("keystone", enabled=True),
+            "untenanted": user("keystone", enabled=True, max_size=20 * TIB),
+            "objects_only$objects_only": user(
+                "keystone", enabled=True, max_size=10 * TIB
+            ),
             "backup": user("rgw", enabled=False),
         }
     )
@@ -96,7 +119,7 @@ def logged(caplog):
     return [f"{record.levelname} {record.getMessage()}" for record in caplog.records]
 
 
-def test_dry_run_writes_nothing_and_reports_missing_quotas(env, caplog):
+def test_dry_run_writes_nothing_and_reports_mismatched_quotas(env, caplog):
     with pytest.raises(SystemExit) as exit:
         cli.main(["--config", env.config])
     assert exit.value.code == 1
@@ -105,14 +128,16 @@ def test_dry_run_writes_nothing_and_reports_missing_quotas(env, caplog):
     assert logged(caplog) == [
         "INFO dry run: nothing will be written (use --apply)",
         f"WARNING new$new: quota disabled, would set max_size={10 * TIB} max_objects=-1",
-        f"INFO own$own: quota enabled, unchanged: max_size={50 * TIB} max_objects=-1",
-        "INFO free$free: quota enabled, unchanged: max_size=-1 max_objects=-1",
+        f"INFO big$big: quota enabled, unchanged: max_size={50 * TIB} max_objects=-1",
+        "INFO unlimited$unlimited: quota enabled, unchanged: max_size=-1 max_objects=-1",
+        f"INFO untenanted: quota enabled, unchanged: max_size={20 * TIB} max_objects=-1",
+        f"WARNING objects_only$objects_only: quota enabled, would set max_size={10 * TIB} max_objects=1000",
         "INFO deleted$deleted: user no longer exists",
-        "WARNING 1 Keystone users without an enabled quota",
+        "WARNING 2 Keystone users without their configured quota",
     ]
 
 
-def test_apply_sets_only_disabled_keystone_quotas(env, caplog):
+def test_apply_sets_mismatched_keystone_quotas(env, caplog):
     cli.main(["--config", env.config, "--apply"])
     assert env.rgw.sets == [
         (
@@ -123,24 +148,35 @@ def test_apply_sets_only_disabled_keystone_quotas(env, caplog):
                 "max_size": 10 * TIB,
                 "max_objects": -1,
             },
-        )
+        ),
+        (
+            "objects_only$objects_only",
+            {
+                "enabled": True,
+                "check_on_raw": False,
+                "max_size": 10 * TIB,
+                "max_objects": 1000,
+            },
+        ),
     ]
     assert f"INFO new$new: quota changed: max_size={10 * TIB} max_objects=-1" in (
         logged(caplog)
     )
-    assert logged(caplog)[-1] == "INFO all Keystone users have an enabled quota"
+    assert logged(caplog)[-1] == "INFO all Keystone users have their configured quota"
 
 
 def test_failures_are_logged_and_counted(env, caplog):
-    env.rgw.fail_get = {"own$own"}
+    env.rgw.fail_get = {"big$big"}
     env.rgw.fail_set = {"new$new"}
     with pytest.raises(SystemExit) as exit:
         cli.main(["--config", env.config, "--apply"])
     assert exit.value.code == 1
     assert logged(caplog) == [
         "ERROR new$new: quota update failed: PUT 403 AccessDenied",
-        "ERROR own$own: reading user failed: GET 403 AccessDenied",
-        "INFO free$free: quota enabled, unchanged: max_size=-1 max_objects=-1",
+        "ERROR big$big: reading user failed: GET 403 AccessDenied",
+        "INFO unlimited$unlimited: quota enabled, unchanged: max_size=-1 max_objects=-1",
+        f"INFO untenanted: quota enabled, unchanged: max_size={20 * TIB} max_objects=-1",
+        f"INFO objects_only$objects_only: quota changed: max_size={10 * TIB} max_objects=1000",
         "INFO deleted$deleted: user no longer exists",
-        "WARNING 2 Keystone users without an enabled quota",
+        "WARNING 2 Keystone users without their configured quota",
     ]

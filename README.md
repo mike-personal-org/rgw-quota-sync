@@ -1,27 +1,27 @@
 # rgw-quota-sync
 
 This tool synchronizes quotas for keystone-based projects in ceph-rgw (Reef).
-Currently, quotas are default only, and read from a config file.
+Quotas are read from a config file: a default, plus optional per-project overrides.
 
 It lists all RGW users and, for each one RGW created on a Keystone login
 (user info `type: keystone`), looks at its user quota:
 
 | User quota | Action |
 | --- | --- |
-| Enabled, any value (including unlimited) | unchanged |
-| Disabled | set to the config quota and enabled |
+| Enabled, equal to the default or the project's override | unchanged |
+| Disabled, or enabled with other values | set to the config quota and enabled |
 
 Users that aren't Keystone users (backup, service users, ...) are never
-changed. Changing `max_size` later does not update users already set.
+changed.
 
 How this interacts with RGW's own quota settings:
 
 - An enabled per-user quota replaces the global user quota
   (`radosgw-admin global quota set --quota-scope=user`), so for every user
   this tool sets, its quota is what applies.
-- To exempt a user, enable an unlimited quota on it; the tool leaves it.
+- To exempt a project, give it a `-1` override in the config.
 - With `rgw_user_default_quota_max_size` / `_max_objects` set, RGW gives new
-  users an enabled quota at first login, so the tool leaves those too.
+  users an enabled quota at first login. The tool updates it if it differs.
 
 ## Credentials
 
@@ -44,7 +44,20 @@ access_key: ...
 secret_key: ...
 max_size: 10995116277760  # bytes (10 TiB); -1 = unlimited, 0 blocks all writes
 max_objects: -1           # -1 = unlimited, 0 blocks all writes
+project_quotas:           # optional, per Keystone project
+  0123456789abcdef0123456789abcdef:  # Keystone project ID, not the RGW uid
+    max_size: -1          # unlimited; max_objects stays the default
 ```
+
+Each key under `project_quotas` is a Keystone project ID, as `openstack project
+list` shows it: 32 hex characters, with no dashes and no `$`. An override can
+set `max_size`, `max_objects` or both. Whatever it leaves out takes the default.
+
+The tool finds a user's project from its RGW uid. RGW names the user it creates
+for a Keystone project `<project_id>$<project_id>` (RGW's `<tenant>$<user>`).
+Users created before `rgw_keystone_implicit_tenants` was set are just `<project_id>`.
+For example, RGW uids `0123…cdef$0123…cdef` and `0123…cdef` both use the
+`0123…cdef` entry above.
 
 ## Usage
 
@@ -57,11 +70,12 @@ Dry run unless `--apply`. Logs one line per Keystone user in oslo.log's format:
 ```
 ... INFO rgw_quota_sync.cli [-] <uid>: quota enabled, unchanged: max_size=... max_objects=...
 ... WARNING rgw_quota_sync.cli [-] <uid>: quota disabled, would set max_size=... max_objects=...
+... WARNING rgw_quota_sync.cli [-] <uid>: quota enabled, would set max_size=... max_objects=...
 ... INFO rgw_quota_sync.cli [-] <uid>: quota changed: max_size=... max_objects=...
 ... ERROR rgw_quota_sync.cli [-] <uid>: quota update failed: PUT 403 AccessDenied
 ```
 
-It ends with how many Keystone users are without an enabled quota, and exits
+It ends with how many Keystone users are without their configured quota, and exits
 `1` if there are any (including users that would be set in a dry run, or that
 couldn't be read), so a dry run also works as a check.
 
@@ -94,7 +108,9 @@ TODO: Use Keystone unified limits to set these.
 TODO: Propose an upstream Ceph docs update for `GET /admin/user?list`
 (`RGWOp_User_List`: `max-entries`, `marker`, response `keys` / `truncated` /
 `marker`; needs `users=read`), which exists since Nautilus but isn't in the
-Admin Ops docs.
+Admin Ops docs. Also note that Set User Quota's JSON body must be sent as
+`UNSIGNED-PAYLOAD`: Reef answers 501 NotImplemented to a SigV4-signed body
+(rgw_rest_s3.cc only allows signed bodies for a fixed list of operations).
 
 TODO: Go rewrite on [go-ceph `rgw/admin`](https://pkg.go.dev/github.com/ceph/go-ceph/rgw/admin)
 and [gophercloud](https://github.com/gophercloud/gophercloud), both maintained upstream,
