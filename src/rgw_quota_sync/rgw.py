@@ -109,7 +109,11 @@ def _raise_for_error(response: requests.Response) -> None:
 class RGW:
     def __init__(self, endpoint: str, access_key: str, secret_key: str) -> None:
         self.endpoint = endpoint.rstrip("/")
-        self.host = urlsplit(self.endpoint).netloc
+        parts = urlsplit(self.endpoint)
+        # Requests are signed for /admin/user, so a path prefix would get a 403.
+        if parts.scheme not in ("http", "https") or parts.path:
+            raise ValueError(f"endpoint must be http(s)://host[:port]: {endpoint!r}")
+        self.host = parts.netloc
         self.access_key = access_key
         self.secret_key = secret_key
         self.session = requests.Session()

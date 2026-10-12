@@ -23,6 +23,8 @@ project_quotas:  # project IDs, matching the uids in env below
     max_size: 21990232555520  # 20 TiB
   objects_only:
     max_objects: 1000
+  nobody:  # no RGW user
+    max_size: -1
 """
 
 
@@ -30,32 +32,53 @@ def test_config(tmp_path):
     path = tmp_path / "config.yaml"
     path.write_text(CONFIG)
     config = cli.Config.load(str(path))
-    assert config.max_size == 10 * TIB
-    assert config.max_objects == -1
+    Quota = cli.Quota
     # No override: the default.
-    assert config.quota_for("new$new") == {"max_size": 10 * TIB, "max_objects": -1}
-    assert config.quota_for("big$big") == {"max_size": 50 * TIB, "max_objects": -1}
+    assert config.quota_for("new$new") == Quota(max_size=10 * TIB, max_objects=-1)
+    assert config.quota_for("big$big") == Quota(max_size=50 * TIB, max_objects=-1)
     # A uid without "$" is the project ID itself.
-    assert config.quota_for("untenanted") == {"max_size": 20 * TIB, "max_objects": -1}
+    assert config.quota_for("untenanted") == Quota(max_size=20 * TIB, max_objects=-1)
     # An override of one field keeps the default for the other.
-    assert config.quota_for("objects_only$objects_only") == {
-        "max_size": 10 * TIB,
-        "max_objects": 1000,
-    }
+    assert config.quota_for("objects_only$objects_only") == Quota(
+        max_size=10 * TIB, max_objects=1000
+    )
     assert "secret" not in repr(config)
 
 
-def test_config_rejects_unknown_keys(tmp_path):
+@pytest.mark.parametrize(
+    "extra", ["max-size: 1", "project_quotas: {abc: {max-size: -1}}"]
+)
+def test_config_rejects_unknown_keys(tmp_path, extra):
     path = tmp_path / "config.yaml"
-    path.write_text(CONFIG + "max-size: 1\n")
-    with pytest.raises(TypeError, match="max-size"):
+    path.write_text(MINIMAL_CONFIG + extra + "\n")
+    with pytest.raises(ValueError, match="unknown.* key 'max-size'"):
         cli.Config.load(str(path))
 
 
-def user(user_type, enabled, max_size=-1, max_objects=-1):
+def test_config_rejects_non_integer_values(tmp_path):
+    path = tmp_path / "config.yaml"
+    for config in [
+        MINIMAL_CONFIG.replace("max_size: 1", "max_size: 10T"),
+        MINIMAL_CONFIG + "project_quotas: {abc: {max_size: 10T}}\n",
+    ]:
+        path.write_text(config)
+        with pytest.raises(TypeError, match="must be integers, got '10T'"):
+            cli.Config.load(str(path))
+
+
+MINIMAL_CONFIG = """
+endpoint: https://rgw:8080
+access_key: access
+secret_key: secret
+max_objects: -1
+max_size: 1
+"""
+
+
+def user(user_type, enabled, max_size=-1, max_objects=-1, check_on_raw=False):
     quota = {
         "enabled": enabled,
-        "check_on_raw": False,
+        "check_on_raw": check_on_raw,
         "max_size": max_size,
         "max_size_kb": 0,
         "max_objects": max_objects,
@@ -100,7 +123,7 @@ def env(tmp_path, monkeypatch, caplog):
             "unlimited$unlimited": user("keystone", enabled=True),
             "untenanted": user("keystone", enabled=True, max_size=20 * TIB),
             "objects_only$objects_only": user(
-                "keystone", enabled=True, max_size=10 * TIB
+                "keystone", enabled=True, max_size=10 * TIB, check_on_raw=True
             ),
             "backup": user("rgw", enabled=False),
         }
@@ -127,12 +150,18 @@ def test_dry_run_writes_nothing_and_reports_mismatched_quotas(env, caplog):
     assert env.rgw.sets == []
     assert logged(caplog) == [
         "INFO dry run: nothing will be written (use --apply)",
-        f"WARNING new$new: quota disabled, would set max_size={10 * TIB} max_objects=-1",
-        f"INFO big$big: quota enabled, unchanged: max_size={50 * TIB} max_objects=-1",
-        "INFO unlimited$unlimited: quota enabled, unchanged: max_size=-1 max_objects=-1",
-        f"INFO untenanted: quota enabled, unchanged: max_size={20 * TIB} max_objects=-1",
-        f"WARNING objects_only$objects_only: quota enabled, would set max_size={10 * TIB} max_objects=1000",
+        (
+            "WARNING new$new: quota would change from disabled max_size=-1 "
+            f"max_objects=-1 to enabled max_size={10 * TIB} max_objects=-1"
+        ),
+        (
+            "WARNING objects_only$objects_only: quota would change from enabled "
+            f"max_size={10 * TIB} max_objects=-1 to enabled max_size={10 * TIB} "
+            "max_objects=1000"
+        ),
+        "INFO backup: not a Keystone user (type rgw), skipped",
         "INFO deleted$deleted: user no longer exists",
+        "WARNING project_quotas: no RGW user for project nobody",
         "WARNING 2 Keystone users without their configured quota",
     ]
 
@@ -153,15 +182,16 @@ def test_apply_sets_mismatched_keystone_quotas(env, caplog):
             "objects_only$objects_only",
             {
                 "enabled": True,
-                "check_on_raw": False,
+                "check_on_raw": True,  # kept as it was
                 "max_size": 10 * TIB,
                 "max_objects": 1000,
             },
         ),
     ]
-    assert f"INFO new$new: quota changed: max_size={10 * TIB} max_objects=-1" in (
-        logged(caplog)
-    )
+    assert (
+        "INFO new$new: quota changed from disabled max_size=-1 max_objects=-1 "
+        f"to enabled max_size={10 * TIB} max_objects=-1"
+    ) in logged(caplog)
     assert logged(caplog)[-1] == "INFO all Keystone users have their configured quota"
 
 
@@ -174,9 +204,13 @@ def test_failures_are_logged_and_counted(env, caplog):
     assert logged(caplog) == [
         "ERROR new$new: quota update failed: PUT 403 AccessDenied",
         "ERROR big$big: reading user failed: GET 403 AccessDenied",
-        "INFO unlimited$unlimited: quota enabled, unchanged: max_size=-1 max_objects=-1",
-        f"INFO untenanted: quota enabled, unchanged: max_size={20 * TIB} max_objects=-1",
-        f"INFO objects_only$objects_only: quota changed: max_size={10 * TIB} max_objects=1000",
+        (
+            "INFO objects_only$objects_only: quota changed from enabled "
+            f"max_size={10 * TIB} max_objects=-1 to enabled max_size={10 * TIB} "
+            "max_objects=1000"
+        ),
+        "INFO backup: not a Keystone user (type rgw), skipped",
         "INFO deleted$deleted: user no longer exists",
+        "WARNING project_quotas: no RGW user for project nobody",
         "WARNING 2 Keystone users without their configured quota",
     ]

@@ -92,6 +92,22 @@ def make_rgw(session):
     return rgw
 
 
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "rgw.example.org:8080",  # no scheme
+        "https://rgw.example.org:8080/rgw",  # requests are signed for /admin/user
+    ],
+)
+def test_rejects_bad_endpoint(endpoint):
+    with pytest.raises(ValueError, match="endpoint must be"):
+        RGW(endpoint, ACCESS_KEY, SECRET_KEY)
+
+
+def test_accepts_trailing_slash():
+    assert RGW(f"{ENDPOINT}/", ACCESS_KEY, SECRET_KEY).endpoint == ENDPOINT
+
+
 def test_list_users_follows_markers():
     session = FakeSession(
         (200, {"keys": ["a", "b"], "truncated": True, "marker": "m1"}),

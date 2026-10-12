@@ -19,7 +19,8 @@ How this interacts with RGW's own quota settings:
 - An enabled per-user quota replaces the global user quota
   (`radosgw-admin global quota set --quota-scope=user`), so for every user
   this tool sets, its quota is what applies.
-- To exempt a project, give it a `-1` override in the config.
+- To exempt a project, give it an override of `max_size: -1` and
+  `max_objects: -1`.
 - With `rgw_user_default_quota_max_size` / `_max_objects` set, RGW gives new
   users an enabled quota at first login. The tool updates it if it differs.
 
@@ -45,13 +46,15 @@ secret_key: ...
 max_size: 10995116277760  # bytes (10 TiB); -1 = unlimited, 0 blocks all writes
 max_objects: -1           # -1 = unlimited, 0 blocks all writes
 project_quotas:           # optional, per Keystone project
-  0123456789abcdef0123456789abcdef:  # Keystone project ID, not the RGW uid
+  "0123456789abcdef0123456789abcdef":  # Keystone project ID, not the RGW uid
     max_size: -1          # unlimited; max_objects stays the default
 ```
 
 Each key under `project_quotas` is a Keystone project ID, as `openstack project
-list` shows it: 32 hex characters, with no dashes and no `$`. An override can
-set `max_size`, `max_objects` or both. Whatever it leaves out takes the default.
+list` shows it: 32 hex characters, with no dashes and no `$`. Quote it, or YAML
+may read an ID of only digits as a number. An override can set `max_size`,
+`max_objects` or both. Whatever it leaves out takes the default. The tool refuses
+to start on an unknown key.
 
 The tool finds a user's project from its RGW uid. RGW names the user it creates
 for a Keystone project `<project_id>$<project_id>` (RGW's `<tenant>$<user>`).
@@ -62,22 +65,34 @@ For example, RGW uids `0123…cdef$0123…cdef` and `0123…cdef` both use the
 ## Usage
 
 ```
-rgw-quota-sync --config config.yaml [--apply]
+rgw-quota-sync --config config.yaml [--apply] [--log-level DEBUG|INFO|WARNING|ERROR]
 ```
 
-Dry run unless `--apply`. Logs one line per Keystone user in oslo.log's format:
+Dry run unless `--apply`. Logs in oslo.log's format. At the default level, INFO,
+every user is logged except Keystone users whose quota is already right:
 
 ```
-... INFO rgw_quota_sync.cli [-] <uid>: quota enabled, unchanged: max_size=... max_objects=...
-... WARNING rgw_quota_sync.cli [-] <uid>: quota disabled, would set max_size=... max_objects=...
-... WARNING rgw_quota_sync.cli [-] <uid>: quota enabled, would set max_size=... max_objects=...
-... INFO rgw_quota_sync.cli [-] <uid>: quota changed: max_size=... max_objects=...
+... WARNING rgw_quota_sync.cli [-] <uid>: quota would change from disabled max_size=-1 max_objects=-1 to enabled max_size=... max_objects=...
+... INFO rgw_quota_sync.cli [-] <uid>: quota changed from enabled max_size=... max_objects=... to enabled max_size=... max_objects=...
 ... ERROR rgw_quota_sync.cli [-] <uid>: quota update failed: PUT 403 AccessDenied
+... ERROR rgw_quota_sync.cli [-] <uid>: reading user failed: GET 403 AccessDenied
+... INFO rgw_quota_sync.cli [-] <uid>: user no longer exists
+... INFO rgw_quota_sync.cli [-] <uid>: not a Keystone user (type rgw), skipped
+... WARNING rgw_quota_sync.cli [-] project_quotas: no RGW user for project <project_id>
 ```
 
-It ends with how many Keystone users are without their configured quota, and exits
-`1` if there are any (including users that would be set in a dry run, or that
-couldn't be read), so a dry run also works as a check.
+The last warning means an override's project ID matches no RGW user: a typo, or
+a project that hasn't used object storage yet. `--log-level DEBUG` also logs
+`<uid>: quota unchanged: enabled max_size=... max_objects=...`.
+
+The last line is either `<n> Keystone users without their configured quota`
+(WARNING, exit `1`) or `all Keystone users have their configured quota`. Users
+that a dry run would change, or that couldn't be read, count, so a dry run also
+works as a check.
+
+Every enabled quota that differs from the config is overwritten, including one
+set by hand with `radosgw-admin`. Before the first `--apply`, read a dry run's
+`would change` lines and move any quota you mean to keep into `project_quotas`.
 
 ## Container
 
@@ -102,8 +117,6 @@ the docs don't cover. That uses `GET /admin/user?list`, implemented by
 ```
 tox
 ```
-
-TODO: Use Keystone unified limits to set these.
 
 TODO: Propose an upstream Ceph docs update for `GET /admin/user?list`
 (`RGWOp_User_List`: `max-entries`, `marker`, response `keys` / `truncated` /

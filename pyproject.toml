@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rgw-quota-sync"
 version = "0.1.0"
-description = "Give every Ceph RGW user created by Keystone an enabled quota"
+description = "Give every Ceph RGW user created by Keystone its configured quota"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
