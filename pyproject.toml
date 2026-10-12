@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rgw-quota-sync"
+version = "0.1.0"
+description = "Ensure every Keystone project's Ceph RGW user has a user quota"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "openstacksdk",
+    "rgwadmin>=2.4",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+rgw-quota-sync = "rgw_quota_sync.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
