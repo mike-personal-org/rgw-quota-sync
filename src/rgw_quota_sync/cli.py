@@ -1,179 +1,132 @@
-"""rgw-quota-sync: give every Keystone project's RGW user a user quota."""
+"""Give every RGW user created by Keystone an enabled quota.
+
+Users whose quota is disabled get the configured one. Enabled quotas,
+including enabled-unlimited exemptions, are never touched. Exits 1 if any
+Keystone user is left without an enabled quota (in a dry run: would be).
+"""
+
 import argparse
 import logging
-import os
 import sys
-import time
-from collections import Counter
-from urllib.parse import quote, urlparse
+from dataclasses import dataclass, field
+from typing import Self
 
-import openstack
-from rgwadmin import RGWAdmin
-from rgwadmin.exceptions import NoSuchUser
+import requests
+import yaml
 
-from .quota import (
-    ConfigError,
-    Quota,
-    decide,
-    describe,
-    format_quota,
-    load_config,
-)
+from .rgw import RGW, NoSuchUser
 
-log = logging.getLogger("rgw-quota-sync")
+log = logging.getLogger(__name__)
 
-RGW_TIMEOUT = 30  # seconds per Admin Ops request
+# oslo.log's default format for messages without a request context.
+LOG_FORMAT = "%(asctime)s.%(msecs)03d %(process)d %(levelname)s %(name)s [-] %(message)s"
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(
-        prog="rgw-quota-sync",
-        description="Make sure every Keystone project's Ceph RGW user has a user quota. "
-        "Dry run unless --apply is given.",
-        epilog="RGW admin keys are read from RGW_ACCESS_KEY and RGW_SECRET_KEY.",
-    )
-    p.add_argument("--config", required=True, metavar="PATH", help="YAML config file")
-    p.add_argument(
-        "--os-cloud",
-        default=os.environ.get("OS_CLOUD"),
-        metavar="NAME",
-        help="cloud in clouds.yaml (default: $OS_CLOUD; without either, OS_* env vars are used)",
-    )
-    p.add_argument("--apply", action="store_true", help="write quota changes (default: dry run)")
-    p.add_argument("--domain", metavar="NAME_OR_ID", help="only projects in this Keystone domain")
-    p.add_argument(
-        "--interval",
-        type=int,
-        metavar="SECONDS",
-        help="keep running and repeat every SECONDS (default: run once and exit)",
-    )
-    args = p.parse_args(argv)
-    if args.interval is not None and args.interval < 1:
-        p.error("--interval must be at least 1")
-    return args
+@dataclass
+class Config:
+    endpoint: str  # Admin Ops API base URL, e.g. https://rgw.example.org:8080
+    access_key: str
+    secret_key: str = field(repr=False)  # keep it out of logs
+    max_size: int  # bytes; -1 = unlimited, 0 blocks all writes
+    max_objects: int  # -1 = unlimited, 0 blocks all writes
+
+    @classmethod
+    def load(cls, path: str) -> Self:
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        # A missing or unknown key raises TypeError.
+        return cls(**data)
 
 
-def connect_rgw(cfg):
-    access_key = os.environ.get("RGW_ACCESS_KEY")
-    secret_key = os.environ.get("RGW_SECRET_KEY")
-    if not access_key or not secret_key:
-        raise ConfigError("RGW_ACCESS_KEY and RGW_SECRET_KEY must be set")
-    url = urlparse(cfg.endpoint)
-    return RGWAdmin(
-        access_key=access_key,
-        secret_key=secret_key,
-        server=url.netloc,
-        secure=url.scheme == "https",
-        verify=cfg.verify is not False,
-        ca_bundle=cfg.verify if isinstance(cfg.verify, str) else None,
-        timeout=RGW_TIMEOUT,
-    )
+def sync_user(rgw: RGW, uid: str, config: Config, apply: bool) -> bool:
+    """Make sure one RGW user created by Keystone has an enabled quota.
 
-
-def list_projects(conn, domain):
-    query = {}
-    if domain:
-        query["domain_id"] = conn.identity.find_domain(domain, ignore_missing=False).id
-    return sorted(conn.identity.projects(**query), key=lambda p: (p.name or "", p.id))
-
-
-def sync(cfg, conn, rgw, apply, domain=None):
-    """Run one pass. Returns a Counter of actions; "error" counts failures."""
-    counts = Counter()
+    Logs what happened. Returns False if the user is, or may be, left without
+    an enabled quota.
+    """
     try:
-        projects = list_projects(conn, domain)
-    except Exception as e:
-        log.error("listing Keystone projects failed: %s", e)
-        counts["error"] += 1
-        return counts
+        user = rgw.get_user(uid)
+    except NoSuchUser:
+        log.info("%s: user no longer exists", uid)  # deleted since it was listed
+        return True
+    except requests.RequestException as e:
+        log.error("%s: reading user failed: %s", uid, e)
+        return False
 
-    project_ids = {p.id for p in projects}
-    for project_id in sorted(set(cfg.overrides) - project_ids):
-        where = f" in domain {domain}" if domain else ""
-        log.warning("override %s is not a Keystone project%s; ignoring it", project_id, where)
+    if user["type"] != "keystone":
+        log.debug("%s: not a Keystone user, skipped", uid)
+        return True
 
-    for project in projects:
-        # rgwadmin puts uid into the query string as is; quote it so "$" (and
-        # anything else a custom uid_format produces) arrives intact.
-        uid = quote(cfg.uid(project.id), safe="")
-        is_override = project.id in cfg.overrides
-        desired = cfg.overrides.get(project.id, cfg.default)
-        prefix = f"{project.id}  {project.name}"
+    quota = user["user_quota"]
+    if quota["enabled"]:
+        log.info(
+            "%s: quota enabled, unchanged: max_size=%s max_objects=%s",
+            uid,
+            quota["max_size"],
+            quota["max_objects"],
+        )
+        return True
 
-        try:
-            current = Quota.from_rgw(rgw.get_user_quota(uid=uid))
-        except NoSuchUser:
-            current = None
-        except Exception as e:
-            log.error("%s: reading quota for %s failed: %s", project.id, cfg.uid(project.id), e)
-            print(f"{prefix}  error: read failed", flush=True)
-            counts["error"] += 1
-            continue
+    if not apply:
+        log.warning(
+            "%s: quota disabled, would set max_size=%s max_objects=%s",
+            uid,
+            config.max_size,
+            config.max_objects,
+        )
+        return False
 
-        action, new = decide(current, desired, is_override)
-        if new is not None and apply:
-            try:
-                rgw.set_user_quota(
-                    uid=uid,
-                    quota_type="user",
-                    # Config sizes are whole KiB; -1 (unlimited) stays negative.
-                    max_size_kb=new.max_size // 1024 if new.max_size >= 0 else -1,
-                    max_objects=new.max_objects,
-                    enabled=True,
-                )
-            except Exception as e:
-                log.error("%s: setting quota for %s failed: %s", project.id, cfg.uid(project.id), e)
-                print(f"{prefix}  error: set failed  {format_quota(current)}", flush=True)
-                counts["error"] += 1
-                continue
-
-        after = format_quota(new if new is not None else current)
-        print(f"{prefix}  {describe(action, current)}  {format_quota(current)} -> {after}", flush=True)
-        counts[action] += 1
-    return counts
-
-
-def run_once(args):
-    """Load config, connect and sync once. Returns the exit code."""
+    new_quota = {
+        "enabled": True,
+        # The request replaces the whole quota, so keep this setting as it was.
+        "check_on_raw": quota["check_on_raw"],
+        "max_size": config.max_size,
+        "max_objects": config.max_objects,
+    }
     try:
-        with open(args.config) as f:
-            cfg = load_config(f.read())
-        rgw = connect_rgw(cfg)
-    except (OSError, ConfigError) as e:
-        log.error("%s", e)
-        return 2
-    try:
-        conn = openstack.connect(cloud=args.os_cloud)
-    except Exception as e:
-        log.error("connecting to Keystone failed: %s", e)
-        return 1
+        rgw.set_quota(uid, new_quota)
+    except requests.RequestException as e:
+        log.error("%s: quota update failed: %s", uid, e)
+        return False
+    log.info(
+        "%s: quota changed: max_size=%s max_objects=%s",
+        uid,
+        config.max_size,
+        config.max_objects,
+    )
+    return True
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True)
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="write changes (default: dry run)",
+    )
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT
+    )
+    config = Config.load(args.config)
+    rgw = RGW(config.endpoint, config.access_key, config.secret_key)
 
     if not args.apply:
-        print("dry run: no changes will be written (use --apply)", flush=True)
-    counts = sync(cfg, conn, rgw, args.apply, args.domain)
-    summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "no projects"
-    print(f"summary{'' if args.apply else ' (dry run)'}: {summary}", flush=True)
-    return 1 if counts["error"] else 0
+        log.info("dry run: nothing will be written (use --apply)")
 
+    without_quota = 0
+    for uid in rgw.list_users():
+        if not sync_user(rgw, uid, config, args.apply):
+            without_quota += 1
 
-def main(argv=None):
-    args = parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    # openstacksdk and urllib3 are chatty at INFO.
-    logging.getLogger("openstack").setLevel(logging.WARNING)
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-
-    if args.interval is None:
-        return run_once(args)
-
-    # Long-running mode (e.g. a service container): re-read the config each
-    # pass so override edits apply without a restart, and keep going on errors.
-    while True:
-        rc = run_once(args)
-        if rc:
-            log.warning("pass finished with errors (exit code %d); retrying in %ds", rc, args.interval)
-        time.sleep(args.interval)
+    if without_quota:
+        log.warning("%d Keystone users without an enabled quota", without_quota)
+        sys.exit(1)
+    log.info("all Keystone users have an enabled quota")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

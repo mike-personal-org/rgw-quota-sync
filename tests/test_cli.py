@@ -1,154 +1,146 @@
-"""Main-loop tests with fake Keystone and RGW clients (no network)."""
+import logging
 from types import SimpleNamespace
 
 import pytest
-from rgwadmin.exceptions import AccessDenied, NoSuchUser
+import requests
 
 from rgw_quota_sync import cli
+from rgw_quota_sync.rgw import NoSuchUser
 
-T = 1024**4
-UNLIMITED = {"enabled": False, "max_size": -1, "max_size_kb": 0, "max_objects": -1}
-
+TIB = 1024**4
 CONFIG = """
-rgw: {endpoint: "https://rgw.example.org:8080"}
-default: {max_size: 10T, max_objects: -1}
-overrides:
-  "p-over": {max_size: 1K}
-  "not-a-project": {max_size: 1G}
+endpoint: https://rgw:8080
+access_key: access
+secret_key: secret
+max_size: 10995116277760
+max_objects: -1
 """
 
 
+def test_config(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(CONFIG)
+    config = cli.Config.load(str(path))
+    assert config.max_size == 10 * TIB
+    assert config.max_objects == -1
+    assert "secret" not in repr(config)
+
+
+def test_config_rejects_unknown_keys(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(CONFIG + "max-size: 1\n")
+    with pytest.raises(TypeError, match="max-size"):
+        cli.Config.load(str(path))
+
+
+def user(user_type, enabled, max_size=-1, max_objects=-1):
+    quota = {
+        "enabled": enabled,
+        "check_on_raw": False,
+        "max_size": max_size,
+        "max_size_kb": 0,
+        "max_objects": max_objects,
+    }
+    return {"type": user_type, "user_quota": quota}
+
+
 class FakeRGW:
-    def __init__(self, quotas, fail_get=(), fail_set=()):
-        self.quotas = quotas  # uid -> quota dict
-        self.fail_get = fail_get
-        self.fail_set = fail_set
+    def __init__(self, users):
+        self.users = users  # uid -> user info as RGW returns it
+        self.listed = list(users) + ["deleted$deleted"]  # removed after listing
+        self.fail_get = set()  # uids whose get_user fails
+        self.fail_set = set()  # uids whose set_quota fails
         self.sets = []
 
-    def get_user_quota(self, uid):
+    def list_users(self):
+        yield from self.listed
+
+    def get_user(self, uid):
         if uid in self.fail_get:
-            raise AccessDenied("AccessDenied")
-        if uid not in self.quotas:
-            raise NoSuchUser("NoSuchUser")
-        return self.quotas[uid]
+            raise requests.HTTPError("GET 403 AccessDenied")
+        if uid not in self.users:
+            raise NoSuchUser("GET 404 NoSuchUser")
+        return self.users[uid]
 
-    def set_user_quota(self, uid, quota_type, max_size_kb, max_objects, enabled):
+    def set_quota(self, uid, quota):
         if uid in self.fail_set:
-            raise AccessDenied("AccessDenied")
-        self.sets.append((uid, quota_type, max_size_kb, max_objects, enabled))
-
-
-class FakeIdentity:
-    def __init__(self, projects):
-        self._projects = projects
-        self.queries = []
-
-    def projects(self, **query):
-        self.queries.append(query)
-        return iter(self._projects)
-
-    def find_domain(self, name_or_id, ignore_missing=True):
-        return SimpleNamespace(id="dom-id")
-
-
-def project(pid, name):
-    return SimpleNamespace(id=pid, name=name)
-
-
-PROJECTS = [
-    project("p-new", "fresh"),
-    project("p-own", "handset"),
-    project("p-over", "tiny"),
-    project("p-none", "never-logged-in"),
-]
+            raise requests.HTTPError("PUT 403 AccessDenied")
+        self.sets.append((uid, quota))
 
 
 @pytest.fixture
-def env(tmp_path, monkeypatch):
-    monkeypatch.setenv("RGW_ACCESS_KEY", "access")
-    monkeypatch.setenv("RGW_SECRET_KEY", "secret")
-    cfg = tmp_path / "config.yaml"
-    cfg.write_text(CONFIG)
-    rgw = FakeRGW({
-        "p-new%24p-new": UNLIMITED,
-        "p-own%24p-own": {"enabled": True, "max_size": 50 * T, "max_objects": -1},
-        "p-over%24p-over": {"enabled": True, "max_size": 10 * T, "max_objects": -1},
-    })
-    identity = FakeIdentity(PROJECTS)
-    made = {}
+def env(tmp_path, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    config = tmp_path / "config.yaml"
+    config.write_text(CONFIG)
 
-    def fake_rgwadmin(**kwargs):
-        made.update(kwargs)
+    rgw = FakeRGW(
+        {
+            "new$new": user("keystone", enabled=False),
+            "own$own": user("keystone", enabled=True, max_size=50 * TIB),
+            "free$free": user("keystone", enabled=True),
+            "backup": user("rgw", enabled=False),
+        }
+    )
+    env = SimpleNamespace(config=str(config), rgw=rgw, rgw_args=None)
+
+    def fake_rgw(*args):
+        env.rgw_args = args
         return rgw
 
-    monkeypatch.setattr(cli, "RGWAdmin", fake_rgwadmin)
-    monkeypatch.setattr(cli.openstack, "connect", lambda cloud=None: SimpleNamespace(identity=identity))
-    return SimpleNamespace(config=str(cfg), rgw=rgw, identity=identity, rgwadmin_kwargs=made)
+    monkeypatch.setattr(cli, "RGW", fake_rgw)
+    return env
 
 
-def test_dry_run_writes_nothing(env, capsys, caplog):
-    assert cli.main(["--config", env.config]) == 0
+def logged(caplog):
+    return [f"{record.levelname} {record.getMessage()}" for record in caplog.records]
+
+
+def test_dry_run_writes_nothing_and_reports_missing_quotas(env, caplog):
+    with pytest.raises(SystemExit) as exit:
+        cli.main(["--config", env.config])
+    assert exit.value.code == 1
+    assert env.rgw_args == ("https://rgw:8080", "access", "secret")
     assert env.rgw.sets == []
-    out = capsys.readouterr().out
-    assert "dry run" in out
-    assert "p-new  fresh  default  off (unlimited/unlimited objects) -> 10T/unlimited objects" in out
-    assert "p-own  handset  keep: own quota 50T  50T/unlimited objects -> 50T/unlimited objects" in out
-    assert "p-over  tiny  override  10T/unlimited objects -> 1K/unlimited objects" in out
-    assert "p-none  never-logged-in  skip: no RGW user  - -> -" in out
-    assert "summary (dry run): default=1, keep=1, override=1, skip=1" in out
-    assert "not-a-project is not a Keystone project" in caplog.text
-    assert env.rgwadmin_kwargs["server"] == "rgw.example.org:8080"
-    assert env.rgwadmin_kwargs["secure"] is True
-
-
-def test_apply_sets_default_and_override(env, capsys):
-    assert cli.main(["--config", env.config, "--apply"]) == 0
-    assert sorted(env.rgw.sets) == [
-        ("p-new%24p-new", "user", 10 * T // 1024, -1, True),
-        ("p-over%24p-over", "user", 1, -1, True),
+    assert logged(caplog) == [
+        "INFO dry run: nothing will be written (use --apply)",
+        f"WARNING new$new: quota disabled, would set max_size={10 * TIB} max_objects=-1",
+        f"INFO own$own: quota enabled, unchanged: max_size={50 * TIB} max_objects=-1",
+        "INFO free$free: quota enabled, unchanged: max_size=-1 max_objects=-1",
+        "INFO deleted$deleted: user no longer exists",
+        "WARNING 1 Keystone users without an enabled quota",
     ]
-    assert "summary: default=1, keep=1, override=1, skip=1" in capsys.readouterr().out
 
 
-def test_errors_are_logged_and_counted(env, capsys, caplog):
-    env.rgw.fail_get = ("p-own%24p-own",)
-    env.rgw.fail_set = ("p-new%24p-new",)
-    assert cli.main(["--config", env.config, "--apply"]) == 1
-    # The other projects were still processed.
-    assert env.rgw.sets == [("p-over%24p-over", "user", 1, -1, True)]
-    out = capsys.readouterr().out
-    assert "summary: error=2, override=1, skip=1" in out
-    assert "reading quota for p-own$p-own failed" in caplog.text
-    assert "setting quota for p-new$p-new failed" in caplog.text
+def test_apply_sets_only_disabled_keystone_quotas(env, caplog):
+    cli.main(["--config", env.config, "--apply"])
+    assert env.rgw.sets == [
+        (
+            "new$new",
+            {
+                "enabled": True,
+                "check_on_raw": False,
+                "max_size": 10 * TIB,
+                "max_objects": -1,
+            },
+        )
+    ]
+    assert f"INFO new$new: quota changed: max_size={10 * TIB} max_objects=-1" in (
+        logged(caplog)
+    )
+    assert logged(caplog)[-1] == "INFO all Keystone users have an enabled quota"
 
 
-def test_domain_filter(env):
-    assert cli.main(["--config", env.config, "--domain", "Default"]) == 0
-    assert env.identity.queries == [{"domain_id": "dom-id"}]
-
-
-def test_missing_rgw_keys(env, monkeypatch, caplog):
-    monkeypatch.delenv("RGW_SECRET_KEY")
-    assert cli.main(["--config", env.config]) == 2
-    assert "RGW_ACCESS_KEY and RGW_SECRET_KEY" in caplog.text
-
-
-def test_bad_config(env, tmp_path):
-    bad = tmp_path / "bad.yaml"
-    bad.write_text("rgw: {}\n")
-    assert cli.main(["--config", str(bad)]) == 2
-
-
-def test_interval_repeats(env, monkeypatch):
-    calls = []
-
-    def fake_sleep(seconds):
-        calls.append(seconds)
-        if len(calls) == 2:
-            raise KeyboardInterrupt
-
-    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
-    with pytest.raises(KeyboardInterrupt):
-        cli.main(["--config", env.config, "--interval", "60"])
-    assert calls == [60, 60]
-    assert len(env.identity.queries) == 2
+def test_failures_are_logged_and_counted(env, caplog):
+    env.rgw.fail_get = {"own$own"}
+    env.rgw.fail_set = {"new$new"}
+    with pytest.raises(SystemExit) as exit:
+        cli.main(["--config", env.config, "--apply"])
+    assert exit.value.code == 1
+    assert logged(caplog) == [
+        "ERROR new$new: quota update failed: PUT 403 AccessDenied",
+        "ERROR own$own: reading user failed: GET 403 AccessDenied",
+        "INFO free$free: quota enabled, unchanged: max_size=-1 max_objects=-1",
+        "INFO deleted$deleted: user no longer exists",
+        "WARNING 2 Keystone users without an enabled quota",
+    ]
