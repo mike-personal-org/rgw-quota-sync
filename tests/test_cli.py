@@ -17,12 +17,22 @@ secret_key: secret
 # As read from Keystone. Project IDs match the uids in env below.
 QUOTAS = Quotas(
     default=Quota(max_size=10 * TIB, max_objects=-1),
-    projects={
+    overrides={
         "big": Quota(max_size=50 * TIB, max_objects=-1),
         "unlimited": Quota(max_size=-1, max_objects=-1),
         "untenanted": Quota(max_size=20 * TIB, max_objects=-1),
         "objects_only": Quota(max_size=10 * TIB, max_objects=1000),
         "nobody": Quota(max_size=-1, max_objects=-1),  # no RGW user
+    },
+    # Not "gone": deleted from Keystone, but its RGW user is left.
+    project_ids={
+        "new",
+        "big",
+        "unlimited",
+        "untenanted",
+        "objects_only",
+        "split",
+        "nobody",
     },
 )
 
@@ -101,6 +111,11 @@ def env(tmp_path, monkeypatch, caplog):
                 "keystone", enabled=True, max_size=10 * TIB, check_on_raw=True
             ),
             "backup": user("rgw", enabled=False),
+            "gone$gone": user("keystone", enabled=False),
+            "one$other": user("keystone", enabled=False),
+            # rgw_keystone_implicit_tenants = s3 or swift
+            "split$split": user("keystone", enabled=True, max_size=10 * TIB),
+            "split": user("keystone", enabled=True, max_size=10 * TIB),
         }
     )
     env = SimpleNamespace(config=str(config), rgw=rgw, rgw_args=None)
@@ -140,13 +155,20 @@ def test_dry_run_writes_nothing_and_reports_mismatched_quotas(env, caplog):
             "max_objects=1000"
         ),
         "INFO backup: not a Keystone user (type rgw), skipped",
+        "WARNING gone$gone: project gone is not in Keystone, skipped",
+        "ERROR one$other: uid is neither <project> nor <project>$<project>",
         "INFO deleted$deleted: user no longer exists",
-        "WARNING 2 Keystone users without their configured quota",
+        (
+            "WARNING project split has 2 RGW users, each with the full quota: "
+            "split$split, split"
+        ),
+        "WARNING 3 Keystone users without their configured quota",
     ]
 
 
 def test_apply_sets_mismatched_keystone_quotas(env, caplog):
-    cli.main(["--config", env.config, "--apply"])
+    with pytest.raises(SystemExit):  # one$other can't be synced
+        cli.main(["--config", env.config, "--apply"])
     assert env.rgw.sets == [
         (
             "new$new",
@@ -171,7 +193,9 @@ def test_apply_sets_mismatched_keystone_quotas(env, caplog):
         "INFO new$new: quota changed from disabled max_size=-1 max_objects=-1 "
         f"to enabled max_size={10 * TIB} max_objects=-1"
     ) in logged(caplog)
-    assert logged(caplog)[-1] == "INFO all Keystone users have their configured quota"
+    assert logged(caplog)[-1] == (
+        "WARNING 1 Keystone users without their configured quota"
+    )
 
 
 def test_failures_are_logged_and_counted(env, caplog):
@@ -189,6 +213,12 @@ def test_failures_are_logged_and_counted(env, caplog):
             "max_objects=1000"
         ),
         "INFO backup: not a Keystone user (type rgw), skipped",
+        "WARNING gone$gone: project gone is not in Keystone, skipped",
+        "ERROR one$other: uid is neither <project> nor <project>$<project>",
         "INFO deleted$deleted: user no longer exists",
-        "WARNING 2 Keystone users without their configured quota",
+        (
+            "WARNING project split has 2 RGW users, each with the full quota: "
+            "split$split, split"
+        ),
+        "WARNING 3 Keystone users without their configured quota",
     ]

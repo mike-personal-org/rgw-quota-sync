@@ -37,14 +37,16 @@ class FakeResponse:
 class FakeIdentity:
     """Answers like Keystone's GET /v3/registered_limits and /v3/limits."""
 
-    def __init__(self, registered_limits, limits):
+    def __init__(self, registered_limits, limits, projects=("big",)):
         self.collections = {
             "registered_limits": registered_limits,
             "limits": limits,
+            "projects": [{"id": project} for project in projects],
         }
         self.truncated = False
 
-    def get(self, url, *, params):
+    def get(self, url, *, params, raise_exc):
+        assert raise_exc  # or a Keystone error would look like an empty answer
         collection = url.lstrip("/")
         matching = [
             entry
@@ -78,17 +80,16 @@ def test_load_quotas():
     )
     quotas = keystone.load_quotas(identity, SERVICE, region=None)
     assert quotas.default == Quota(max_size=10 * 1024 * GIB, max_objects=-1)
-    assert quotas.projects == {
+    assert quotas.overrides == {
         "big": Quota(max_size=50 * 1024 * GIB, max_objects=-1),
         "unlimited": Quota(max_size=-1, max_objects=-1),  # -1 isn't multiplied
         "read_only": Quota(max_size=0, max_objects=0),
         # A resource without a project limit keeps the default.
         "objects_only": Quota(max_size=10 * 1024 * GIB, max_objects=1000),
     }
-    # The uid's part before "$" is the project ID; a uid without "$" is all of it.
-    assert quotas.quota_for("big$big") == quotas.projects["big"]
-    assert quotas.quota_for("big") == quotas.projects["big"]
-    assert quotas.quota_for("new$new") == quotas.default
+    assert quotas.quota_for("big") == quotas.overrides["big"]
+    assert quotas.quota_for("new") == quotas.default
+    assert quotas.project_ids == {"big"}
 
 
 def test_load_quotas_reads_only_its_region():
@@ -102,7 +103,7 @@ def test_load_quotas_reads_only_its_region():
     )
     quotas = keystone.load_quotas(identity, SERVICE, region="here")
     assert quotas.default == Quota(max_size=10 * 1024 * GIB, max_objects=-1)
-    assert quotas.projects == {"big": Quota(max_size=50 * 1024 * GIB, max_objects=-1)}
+    assert quotas.overrides == {"big": Quota(max_size=50 * 1024 * GIB, max_objects=-1)}
 
 
 def test_load_quotas_without_region_refuses_limits_of_several_regions():
@@ -137,6 +138,17 @@ def test_load_quotas_refuses_truncated_list():
     identity.truncated = True
     with pytest.raises(RuntimeError, match="truncated the registered_limits list"):
         keystone.load_quotas(identity, SERVICE, region=None)
+
+
+@pytest.mark.parametrize("uid", ["abc$abc", "abc"])
+def test_project_id(uid):
+    assert keystone.project_id(uid) == "abc"
+
+
+@pytest.mark.parametrize("uid", ["abc$def", "abc$", "$abc"])
+def test_project_id_refuses_other_uids(uid):
+    with pytest.raises(ValueError, match="neither <project> nor"):
+        keystone.project_id(uid)
 
 
 @pytest.mark.parametrize(

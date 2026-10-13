@@ -27,13 +27,17 @@ def project_id(rgw_uid: str) -> str:
 
     rgw_uid is "<project_id>$<project_id>" (RGW's "<tenant>$<user>"), or
     just "<project_id>" for users created before rgw_keystone_implicit_tenants.
+    Raises ValueError for any other uid.
     """
-    return rgw_uid.split("$")[0]
+    tenant, dollar, user = rgw_uid.partition("$")
+    if dollar and tenant != user:
+        raise ValueError("uid is neither <project> nor <project>$<project>")
+    return tenant
 
 
 @dataclass(frozen=True)
 class Quota:
-    max_size: int  # bytes; -1 = unlimited, 0 blocks all writes
+    max_size: int  # bytes; -1 = unlimited, 0 still allows empty objects
     max_objects: int  # -1 = unlimited, 0 blocks all writes
 
     @classmethod
@@ -49,17 +53,18 @@ class Quota:
 @dataclass
 class Quotas:
     default: Quota  # from the registered limits
-    projects: dict[str, Quota]  # Keystone project ID (not the RGW uid) -> quota
+    overrides: dict[str, Quota]  # Keystone project ID (not the RGW uid) -> quota
+    project_ids: set[str]  # every project in Keystone
 
-    def quota_for(self, rgw_uid: str) -> Quota:
-        """Return the quota for an RGW user: its project's, or the default."""
-        return self.projects.get(project_id(rgw_uid), self.default)
+    def quota_for(self, project: str) -> Quota:
+        """Return a Keystone project's quota: its override, or the default."""
+        return self.overrides.get(project, self.default)
 
 
 class Identity(Protocol):
     """The part of a keystoneauth Adapter for Keystone v3 used here."""
 
-    def get(self, url: str, *, params: Mapping[str, str]) -> Any: ...
+    def get(self, url: str, *, params: Mapping[str, str], raise_exc: bool) -> Any: ...
 
 
 def check_scope(system_scoped: bool, role_names: list[str]) -> None:
@@ -83,18 +88,17 @@ def service_id(catalog: list[dict[str, Any]]) -> str:
 
 
 def _list(identity: Identity, collection: str, params: Mapping[str, str]) -> list:
-    body = identity.get(f"/{collection}", params=params).json()
-    # Keystone cuts a list at [unified_limit] list_limit, and can't page.
+    # openstacksdk returns HTTP errors as responses unless told to raise.
+    body = identity.get(f"/{collection}", params=params, raise_exc=True).json()
+    # Keystone can cut a list short (list_limit options) and has no way to
+    # page, so a truncated list would miss limits or projects.
     if body.get("truncated"):
-        raise RuntimeError(
-            f"Keystone truncated the {collection} list: raise its "
-            "[unified_limit] list_limit"
-        )
+        raise RuntimeError(f"Keystone truncated the {collection} list")
     return body[collection]
 
 
 def load_quotas(identity: Identity, service: str, region: str | None) -> Quotas:
-    """Read the default quota and every project's override from Keystone.
+    """Read the default quota, every project's override and all project IDs.
 
     Like oslo.limit, only reads limits of the given region, if there is one.
     Raises LookupError if a registered limit is missing or ambiguous.
@@ -130,10 +134,11 @@ def load_quotas(identity: Identity, service: str, region: str | None) -> Quotas:
     return Quotas(
         default=Quota.from_limits(defaults),
         # A resource the project has no limit for keeps the default.
-        projects={
+        overrides={
             project: Quota.from_limits({**defaults, **limits})
             for project, limits in overrides.items()
         },
+        project_ids={project["id"] for project in _list(identity, "projects", {})},
     )
 
 

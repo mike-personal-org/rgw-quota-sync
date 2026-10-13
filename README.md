@@ -34,7 +34,8 @@ limit, or the tool refuses to start:
 | `rgw_user_max_size_gib` | GiB (2^30 bytes) | `max_size` |
 | `rgw_user_max_objects` | objects | `max_objects` |
 
-`-1` is unlimited, and `0` blocks all writes. The size is in GiB because Keystone
+`-1` is unlimited. An object limit of `0` blocks all writes, but a size limit of
+`0` still allows empty objects. The size is in GiB because Keystone
 stores limits as 32-bit integers (at most 2147483647), too small for bytes.
 
 ```
@@ -110,7 +111,21 @@ The tool finds a user's project from its RGW uid. RGW names the user it creates
 for a Keystone project `<project_id>$<project_id>` (RGW's `<tenant>$<user>`).
 Users created before `rgw_keystone_implicit_tenants` was set are just `<project_id>`.
 For example, RGW uids `0123…cdef$0123…cdef` and `0123…cdef` both use the
-`0123…cdef` project's limits.
+`0123…cdef` project's limits. RGW keeps using such a legacy user after
+`rgw_keystone_implicit_tenants` is enabled, so the tool syncs both kinds.
+
+Keystone users that don't fit either form are inconsistent, and so are users
+whose project is gone or projects with more than one user:
+
+| Keystone user | Action |
+| --- | --- |
+| uid `<a>$<b>` with `a` ≠ `b` | ERROR, not changed, counts as without quota |
+| Project deleted from Keystone (which deletes its limits) | WARNING, not changed; the user and its buckets stay until you remove them |
+| Its project has more than one RGW user | WARNING after the run; each user can fill the whole quota |
+
+A project gets a user per API (`<id>$<id>` for one, `<id>` for the other) when
+`rgw_keystone_implicit_tenants` is `s3` or `swift`, or when a legacy user was
+copied rather than renamed.
 
 ## Usage
 
@@ -130,6 +145,9 @@ every user is logged except Keystone users whose quota is already right:
 ... ERROR rgw_quota_sync.cli [-] <uid>: reading user failed: GET 403 AccessDenied
 ... INFO rgw_quota_sync.cli [-] <uid>: user no longer exists
 ... INFO rgw_quota_sync.cli [-] <uid>: not a Keystone user (type rgw), skipped
+... WARNING rgw_quota_sync.cli [-] <uid>: project <project_id> is not in Keystone, skipped
+... ERROR rgw_quota_sync.cli [-] <uid>: uid is neither <project> nor <project>$<project>
+... WARNING rgw_quota_sync.cli [-] project <project_id> has 2 RGW users, each with the full quota: <uid>, <uid>
 ```
 
 `--log-level DEBUG` also logs
@@ -138,8 +156,8 @@ every user is logged except Keystone users whose quota is already right:
 The last line is either `<n> Keystone users without their configured quota`
 (WARNING, exit `1`) or `all Keystone users have their configured quota`, where
 "configured" means set in Keystone. Users
-that a dry run would change, or that couldn't be read, count, so a dry run also
-works as a check.
+that a dry run would change, that couldn't be read, or whose uid doesn't fit,
+count, so a dry run also works as a check.
 
 Every enabled quota that differs from Keystone is overwritten, including one
 set by hand with `radosgw-admin`. Before the first `--apply`, read a dry run's
@@ -161,11 +179,11 @@ docker run --rm --user "$(id -u)" -e OS_CLOUD=quota-sync \
 ## API usage
 
 Keystone: `GET /v3/registered_limits` and `GET /v3/limits`, filtered by
-`service_id`, `resource_name` and (if set) `region_id`, through openstacksdk's
-identity adapter. The `object-store` service ID comes from the token's catalog,
-so no `list_services` permission is needed. Keystone can't page these lists:
-it cuts them at `[unified_limit] list_limit` and marks them `truncated`, and
-the tool then refuses to run rather than miss a project's limit.
+`service_id`, `resource_name` and (if set) `region_id`, and `GET /v3/projects`,
+through openstacksdk's identity adapter. The `object-store` service ID comes
+from the token's catalog. Keystone can't page these lists. If it marks one
+`truncated` (cut short by a `list_limit` option), the tool refuses to run
+rather than miss a limit or a project.
 
 RGW: requests follow the [Reef Admin Ops docs](https://docs.ceph.com/en/reef/radosgw/adminops/)
 (Get User Info, Set User Quota with a JSON body), except listing users, which

@@ -13,7 +13,7 @@ import requests
 import yaml
 
 from . import keystone
-from .keystone import Quota, Quotas
+from .keystone import Quota, Quotas, project_id
 from .rgw import RGW, NoSuchUser
 
 log = logging.getLogger(__name__)
@@ -58,11 +58,18 @@ class Config:
         )
 
 
-def sync_user(rgw: RGW, uid: str, quotas: Quotas, apply: bool) -> bool:
+def sync_user(
+    rgw: RGW,
+    uid: str,
+    quotas: Quotas,
+    apply: bool,
+    keystone_users: dict[str, list[str]],
+) -> bool:
     """Make sure one RGW user created by Keystone has its quota from Keystone.
 
-    Logs what happened. Returns False if the user is, or may be, left without
-    its quota.
+    Logs what happened, and adds a Keystone user's uid to keystone_users under
+    its project ID. Returns False if the user is, or may be, left without its
+    quota.
     """
     try:
         user = rgw.get_user(uid)
@@ -77,9 +84,21 @@ def sync_user(rgw: RGW, uid: str, quotas: Quotas, apply: bool) -> bool:
         log.info("%s: not a Keystone user (type %s), skipped", uid, user["type"])
         return True
 
+    try:
+        project = project_id(uid)
+    except ValueError as e:
+        log.error("%s: %s", uid, e)
+        return False
+    # Keystone deleted the project's limits with it, so there is no quota to
+    # give. The user and its buckets stay until an operator removes them.
+    if project not in quotas.project_ids:
+        log.warning("%s: project %s is not in Keystone, skipped", uid, project)
+        return True
+    keystone_users.setdefault(project, []).append(uid)
+
     rgw_quota = user["user_quota"]
     current = Quota(rgw_quota["max_size"], rgw_quota["max_objects"])
-    wanted = quotas.quota_for(uid)
+    wanted = quotas.quota_for(project)
     if rgw_quota["enabled"] and current == wanted:
         log.debug("%s: quota unchanged: enabled %s", uid, current)
         return True
@@ -137,16 +156,28 @@ def main(argv: list[str] | None = None) -> None:
     log.info(
         "Keystone limits: default %s, overrides for %d projects",
         quotas.default,
-        len(quotas.projects),
+        len(quotas.overrides),
     )
 
     if not args.apply:
         log.info("dry run: nothing will be written (use --apply)")
 
     without_quota = 0
+    keystone_users: dict[str, list[str]] = {}
     for uid in rgw.list_users():
-        if not sync_user(rgw, uid, quotas, args.apply):
+        if not sync_user(rgw, uid, quotas, args.apply, keystone_users):
             without_quota += 1
+
+    # With rgw_keystone_implicit_tenants set to s3 or swift, a project has a
+    # user for each API, and each can fill the project's whole quota.
+    for project, uids in keystone_users.items():
+        if len(uids) > 1:
+            log.warning(
+                "project %s has %d RGW users, each with the full quota: %s",
+                project,
+                len(uids),
+                ", ".join(uids),
+            )
 
     if without_quota:
         log.warning("%d Keystone users without their configured quota", without_quota)
