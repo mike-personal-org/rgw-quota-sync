@@ -4,7 +4,8 @@ from types import SimpleNamespace
 import pytest
 import requests
 
-from rgw_quota_sync import cli
+from rgw_quota_sync import cli, keystone
+from rgw_quota_sync.keystone import Quota, Quotas
 from rgw_quota_sync.rgw import NoSuchUser
 
 TIB = 1024**4
@@ -12,67 +13,41 @@ CONFIG = """
 endpoint: https://rgw:8080
 access_key: access
 secret_key: secret
-max_size: 10995116277760
-max_objects: -1
-project_quotas:  # project IDs, matching the uids in env below
-  big:
-    max_size: 54975581388800  # 50 TiB
-  unlimited:
-    max_size: -1
-  untenanted:
-    max_size: 21990232555520  # 20 TiB
-  objects_only:
-    max_objects: 1000
-  nobody:  # no RGW user
-    max_size: -1
 """
+# As read from Keystone. Project IDs match the uids in env below.
+QUOTAS = Quotas(
+    default=Quota(max_size=10 * TIB, max_objects=-1),
+    projects={
+        "big": Quota(max_size=50 * TIB, max_objects=-1),
+        "unlimited": Quota(max_size=-1, max_objects=-1),
+        "untenanted": Quota(max_size=20 * TIB, max_objects=-1),
+        "objects_only": Quota(max_size=10 * TIB, max_objects=1000),
+        "nobody": Quota(max_size=-1, max_objects=-1),  # no RGW user
+    },
+)
 
 
 def test_config(tmp_path):
     path = tmp_path / "config.yaml"
     path.write_text(CONFIG)
     config = cli.Config.load(str(path))
-    Quota = cli.Quota
-    # No override: the default.
-    assert config.quota_for("new$new") == Quota(max_size=10 * TIB, max_objects=-1)
-    assert config.quota_for("big$big") == Quota(max_size=50 * TIB, max_objects=-1)
-    # A uid without "$" is the project ID itself.
-    assert config.quota_for("untenanted") == Quota(max_size=20 * TIB, max_objects=-1)
-    # An override of one field keeps the default for the other.
-    assert config.quota_for("objects_only$objects_only") == Quota(
-        max_size=10 * TIB, max_objects=1000
-    )
+    assert config == cli.Config("https://rgw:8080", "access", "secret")
     assert "secret" not in repr(config)
 
 
-@pytest.mark.parametrize(
-    "extra", ["max-size: 1", "project_quotas: {abc: {max-size: -1}}"]
-)
-def test_config_rejects_unknown_keys(tmp_path, extra):
+def test_config_rejects_unknown_keys(tmp_path):
     path = tmp_path / "config.yaml"
-    path.write_text(MINIMAL_CONFIG + extra + "\n")
-    with pytest.raises(ValueError, match="unknown.* key 'max-size'"):
+    path.write_text(CONFIG + "endpiont: https://rgw:8080\n")
+    with pytest.raises(ValueError, match="unknown config key 'endpiont'"):
         cli.Config.load(str(path))
 
 
-def test_config_rejects_non_integer_values(tmp_path):
+@pytest.mark.parametrize("key", ["max_size", "max_objects", "project_quotas"])
+def test_config_rejects_quota_keys(tmp_path, key):
     path = tmp_path / "config.yaml"
-    for config in [
-        MINIMAL_CONFIG.replace("max_size: 1", "max_size: 10T"),
-        MINIMAL_CONFIG + "project_quotas: {abc: {max_size: 10T}}\n",
-    ]:
-        path.write_text(config)
-        with pytest.raises(TypeError, match="must be integers, got '10T'"):
-            cli.Config.load(str(path))
-
-
-MINIMAL_CONFIG = """
-endpoint: https://rgw:8080
-access_key: access
-secret_key: secret
-max_objects: -1
-max_size: 1
-"""
+    path.write_text(CONFIG + f"{key}: 1\n")
+    with pytest.raises(ValueError, match="quotas now come from Keystone"):
+        cli.Config.load(str(path))
 
 
 def user(user_type, enabled, max_size=-1, max_objects=-1, check_on_raw=False):
@@ -135,6 +110,7 @@ def env(tmp_path, monkeypatch, caplog):
         return rgw
 
     monkeypatch.setattr(cli, "RGW", fake_rgw)
+    monkeypatch.setattr(keystone, "load_from_cloud", lambda: QUOTAS)
     return env
 
 
@@ -149,6 +125,10 @@ def test_dry_run_writes_nothing_and_reports_mismatched_quotas(env, caplog):
     assert env.rgw_args == ("https://rgw:8080", "access", "secret")
     assert env.rgw.sets == []
     assert logged(caplog) == [
+        (
+            f"INFO Keystone limits: default max_size={10 * TIB} max_objects=-1, "
+            "overrides for 5 projects"
+        ),
         "INFO dry run: nothing will be written (use --apply)",
         (
             "WARNING new$new: quota would change from disabled max_size=-1 "
@@ -161,7 +141,6 @@ def test_dry_run_writes_nothing_and_reports_mismatched_quotas(env, caplog):
         ),
         "INFO backup: not a Keystone user (type rgw), skipped",
         "INFO deleted$deleted: user no longer exists",
-        "WARNING project_quotas: no RGW user for project nobody",
         "WARNING 2 Keystone users without their configured quota",
     ]
 
@@ -201,7 +180,7 @@ def test_failures_are_logged_and_counted(env, caplog):
     with pytest.raises(SystemExit) as exit:
         cli.main(["--config", env.config, "--apply"])
     assert exit.value.code == 1
-    assert logged(caplog) == [
+    assert logged(caplog)[1:] == [
         "ERROR new$new: quota update failed: PUT 403 AccessDenied",
         "ERROR big$big: reading user failed: GET 403 AccessDenied",
         (
@@ -211,6 +190,5 @@ def test_failures_are_logged_and_counted(env, caplog):
         ),
         "INFO backup: not a Keystone user (type rgw), skipped",
         "INFO deleted$deleted: user no longer exists",
-        "WARNING project_quotas: no RGW user for project nobody",
         "WARNING 2 Keystone users without their configured quota",
     ]
