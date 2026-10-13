@@ -25,7 +25,7 @@ LOG_FORMAT = (
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # The keys allowed in the config file.
-CONFIG_KEYS = ("endpoint", "access_key", "secret_key")
+CONFIG_KEYS = ("endpoint", "access_key", "secret_key", "keystone_endpoint_id")
 # Keys of older versions, which read quotas from the config file.
 OLD_QUOTA_KEYS = ("max_size", "max_objects", "project_quotas")
 
@@ -35,6 +35,8 @@ class Config:
     endpoint: str  # Admin Ops API base URL, e.g. https://rgw.example.org:8080
     access_key: str
     secret_key: str = field(repr=False)  # keep it out of logs
+    # RGW's endpoint in the Keystone catalog, to pin the service and region.
+    keystone_endpoint_id: str | None = None
 
     @classmethod
     def load(cls, path: str) -> Self:
@@ -55,6 +57,7 @@ class Config:
             endpoint=data["endpoint"],
             access_key=data["access_key"],
             secret_key=data["secret_key"],
+            keystone_endpoint_id=data.get("keystone_endpoint_id"),
         )
 
 
@@ -152,7 +155,7 @@ def main(argv: list[str] | None = None) -> None:
     config = Config.load(args.config)
     rgw = RGW(config.endpoint, config.access_key, config.secret_key)
     # Read all limits before changing anything, so a Keystone error stops the run.
-    quotas = keystone.load_from_cloud()
+    quotas = keystone.load_from_cloud(config.keystone_endpoint_id)
     log.info(
         "Keystone limits: default %s, overrides for %d projects",
         quotas.default,

@@ -42,6 +42,8 @@ def test_config(tmp_path):
     path.write_text(CONFIG)
     config = cli.Config.load(str(path))
     assert config == cli.Config("https://rgw:8080", "access", "secret")
+    path.write_text(CONFIG + "keystone_endpoint_id: abc\n")
+    assert cli.Config.load(str(path)).keystone_endpoint_id == "abc"
     assert "secret" not in repr(config)
 
 
@@ -125,7 +127,12 @@ def env(tmp_path, monkeypatch, caplog):
         return rgw
 
     monkeypatch.setattr(cli, "RGW", fake_rgw)
-    monkeypatch.setattr(keystone, "load_from_cloud", lambda: QUOTAS)
+
+    def fake_load_from_cloud(endpoint_id):
+        env.keystone_endpoint_id = endpoint_id
+        return QUOTAS
+
+    monkeypatch.setattr(keystone, "load_from_cloud", fake_load_from_cloud)
     return env
 
 
@@ -138,6 +145,7 @@ def test_dry_run_writes_nothing_and_reports_mismatched_quotas(env, caplog):
         cli.main(["--config", env.config])
     assert exit.value.code == 1
     assert env.rgw_args == ("https://rgw:8080", "access", "secret")
+    assert env.keystone_endpoint_id is None
     assert env.rgw.sets == []
     assert logged(caplog) == [
         (

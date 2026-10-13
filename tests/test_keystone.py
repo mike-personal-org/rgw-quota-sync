@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 
 from rgw_quota_sync import keystone
@@ -44,9 +46,12 @@ class FakeIdentity:
             "projects": [{"id": project} for project in projects],
         }
         self.truncated = False
+        self.model = "flat"
 
     def get(self, url, *, params, raise_exc):
         assert raise_exc  # or a Keystone error would look like an empty answer
+        if url == "/limits/model":
+            return FakeResponse({"model": {"name": self.model, "description": ""}})
         collection = url.lstrip("/")
         matching = [
             entry
@@ -111,16 +116,6 @@ def test_load_quotas_without_region_refuses_limits_of_several_regions():
     with pytest.raises(LookupError, match=f"want one registered limit {MAX_SIZE} "):
         keystone.load_quotas(identity, SERVICE, region=None)
 
-    identity = FakeIdentity(
-        defaults(),
-        [
-            limit(MAX_SIZE, 1, project="big", region="here"),
-            limit(MAX_SIZE, 2, project="big", region="other"),
-        ],
-    )
-    with pytest.raises(LookupError, match=f"project big has several {MAX_SIZE} "):
-        keystone.load_quotas(identity, SERVICE, region=None)
-
 
 def test_load_quotas_needs_both_registered_limits():
     identity = FakeIdentity(defaults()[:1], [])
@@ -131,6 +126,24 @@ def test_load_quotas_needs_both_registered_limits():
         keystone.load_quotas(identity, SERVICE, region=None)
     with pytest.raises(LookupError, match="for service svc in region here, found 0"):
         keystone.load_quotas(identity, SERVICE, region="here")
+
+
+def test_load_quotas_warns_about_hierarchical_model(caplog):
+    identity = FakeIdentity(defaults(), [])
+    keystone.load_quotas(identity, SERVICE, region=None)
+    assert caplog.records == []
+
+    identity.model = "strict_two_level"
+    keystone.load_quotas(identity, SERVICE, region=None)
+    assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+        (
+            logging.WARNING,
+            (
+                "Keystone limits: enforcement model is strict_two_level, but each "
+                "project's RGW user gets its own limit, not a share of its parent's"
+            ),
+        )
+    ]
 
 
 def test_load_quotas_refuses_truncated_list():
@@ -151,26 +164,40 @@ def test_project_id_refuses_other_uids(uid):
         keystone.project_id(uid)
 
 
-@pytest.mark.parametrize(
-    "system_scoped, roles",
-    [(True, ["reader"]), (False, ["admin", "member", "reader"]), (False, ["service"])],
-)
-def test_check_scope_allows_tokens_that_see_all_projects(system_scoped, roles):
-    keystone.check_scope(system_scoped, roles)
-
-
-def test_check_scope_refuses_tokens_that_see_some_projects():
+def test_check_scope():
+    keystone.check_scope(system_scoped=True)
     with pytest.raises(PermissionError, match="system scoped"):
-        keystone.check_scope(False, ["member", "reader"])
+        keystone.check_scope(system_scoped=False)  # even with admin
 
 
-def test_service_id():
-    catalog = [
-        {"id": "keystone_id", "type": "identity", "endpoints": []},
-        {"id": "rgw_id", "type": "object-store", "endpoints": []},
-    ]
-    assert keystone.service_id(catalog) == "rgw_id"
+CATALOG = [
+    {"id": "keystone_id", "type": "identity", "endpoints": [{"id": "ks"}]},
+    {
+        "id": "rgw_id",
+        "type": "object-store",
+        "endpoints": [
+            {"id": "rgw_public", "region_id": "here"},
+            {"id": "rgw_global"},  # region_id isn't required
+        ],
+    },
+]
+
+
+def test_find_service_by_type():
+    assert keystone.find_service(CATALOG, None, "here") == ("rgw_id", "here")
+    assert keystone.find_service(CATALOG, None, None) == ("rgw_id", None)
     with pytest.raises(LookupError, match="found 0"):
-        keystone.service_id(catalog[:1])
-    with pytest.raises(LookupError, match="found 2"):
-        keystone.service_id(catalog + catalog[1:])
+        keystone.find_service(CATALOG[:1], None, None)
+    swift = {"id": "swift_id", "type": "object-store", "endpoints": []}
+    with pytest.raises(LookupError, match="found 2: set keystone_endpoint_id"):
+        keystone.find_service(CATALOG + [swift], None, None)
+
+
+def test_find_service_by_endpoint():
+    swift = {"id": "swift_id", "type": "object-store", "endpoints": [{"id": "sw"}]}
+    catalog = CATALOG + [swift]
+    # The endpoint's region, whatever the cloud's region is.
+    assert keystone.find_service(catalog, "rgw_public", "other") == ("rgw_id", "here")
+    assert keystone.find_service(catalog, "rgw_global", "other") == ("rgw_id", None)
+    with pytest.raises(LookupError, match="endpoint nope is not in"):
+        keystone.find_service(catalog, "nope", None)

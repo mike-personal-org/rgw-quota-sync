@@ -5,21 +5,20 @@ a registered limit is the default, and a project limit overrides it.
 https://docs.openstack.org/keystone/latest/admin/unified-limits.html
 """
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, Self
 
 import openstack
 
+log = logging.getLogger(__name__)
+
 SERVICE_TYPE = "object-store"
 # Keystone limits are at most 2**31 - 1, too small for bytes, so size is in GiB.
 MAX_SIZE = "rgw_user_max_size_gib"
 MAX_OBJECTS = "rgw_user_max_objects"
 GIB = 1024**3
-
-# Keystone shows a token every project's limits only if it is system scoped or
-# has one of these roles. Otherwise it silently leaves out other projects'.
-ALL_PROJECTS_ROLES = {"admin", "service"}
 
 
 def project_id(rgw_uid: str) -> str:
@@ -67,24 +66,44 @@ class Identity(Protocol):
     def get(self, url: str, *, params: Mapping[str, str], raise_exc: bool) -> Any: ...
 
 
-def check_scope(system_scoped: bool, role_names: list[str]) -> None:
-    """Raise PermissionError unless the token can list every project's limits."""
-    if system_scoped or ALL_PROJECTS_ROLES & set(role_names):
-        return
-    raise PermissionError(
-        "Keystone only lists a project or domain token's own limits: use a "
-        "system scoped token, e.g. with the reader role on the system"
-    )
+def check_scope(system_scoped: bool) -> None:
+    """Raise PermissionError unless the token is system scoped.
 
-
-def service_id(catalog: list[dict[str, Any]]) -> str:
-    """Return the ID of the object-store service in a Keystone v3 catalog."""
-    ids = [service["id"] for service in catalog if service["type"] == SERVICE_TYPE]
-    if len(ids) != 1:
-        raise LookupError(
-            f"want one {SERVICE_TYPE} service in the Keystone catalog, found {len(ids)}"
+    Keystone 30 also shows every project's limits to a project token with the
+    admin or service role, but silently filters out other projects' for any
+    token it doesn't trust that far. Only system scope is documented to see
+    them all, so don't rely on the rest.
+    """
+    if not system_scoped:
+        raise PermissionError(
+            "Keystone may list only some projects' limits for this token: use a "
+            "system scoped token, e.g. with the reader role on the system"
         )
-    return ids[0]
+
+
+def find_service(
+    catalog: list[dict[str, Any]], endpoint_id: str | None, region: str | None
+) -> tuple[str, str | None]:
+    """Return the service ID and region to read limits for.
+
+    With endpoint_id, both come from that endpoint in the Keystone v3 catalog,
+    like oslo.limit's [oslo_limit] endpoint_id. Otherwise they are the only
+    object-store service and the given region (the cloud's).
+    """
+    if endpoint_id is None:
+        ids = [service["id"] for service in catalog if service["type"] == SERVICE_TYPE]
+        if len(ids) != 1:
+            raise LookupError(
+                f"want one {SERVICE_TYPE} service in the Keystone catalog, "
+                f"found {len(ids)}: set keystone_endpoint_id"
+            )
+        return ids[0], region
+
+    for service in catalog:
+        for endpoint in service["endpoints"]:
+            if endpoint["id"] == endpoint_id:
+                return service["id"], endpoint.get("region_id")
+    raise LookupError(f"endpoint {endpoint_id} is not in the Keystone catalog")
 
 
 def _list(identity: Identity, collection: str, params: Mapping[str, str]) -> list:
@@ -103,8 +122,16 @@ def load_quotas(identity: Identity, service: str, region: str | None) -> Quotas:
     Like oslo.limit, only reads limits of the given region, if there is one.
     Raises LookupError if a registered limit is missing or ambiguous.
     """
+    # Each project gets its own limit, which doesn't fit a hierarchy.
+    model = identity.get("/limits/model", params={}, raise_exc=True).json()
+    if model["model"]["name"] != "flat":
+        log.warning(
+            "Keystone limits: enforcement model is %s, but each project's RGW "
+            "user gets its own limit, not a share of its parent's",
+            model["model"]["name"],
+        )
+
     where = f"service {service}" + (f" in region {region}" if region else "")
-    hint = "if they are for different regions, set the cloud's region_name"
     defaults: dict[str, int] = {}
     overrides: dict[str, dict[str, int]] = {}  # project ID -> resource -> limit
     for resource in (MAX_SIZE, MAX_OBJECTS):
@@ -116,20 +143,15 @@ def load_quotas(identity: Identity, service: str, region: str | None) -> Quotas:
         if len(registered) != 1:
             raise LookupError(
                 f"want one registered limit {resource} for {where}, "
-                f"found {len(registered)}" + (f" ({hint})" if registered else "")
+                f"found {len(registered)}"
+                + (" for several regions: set a region" if registered else "")
             )
         defaults[resource] = registered[0]["default_limit"]
 
+        # Each matches the one registered limit, so a project has at most one.
         for limit in _list(identity, "limits", params):
-            project = limit.get("project_id")
-            if not project:
-                continue  # a domain limit: RGW users belong to projects
-            if resource in overrides.setdefault(project, {}):
-                raise LookupError(
-                    f"project {project} has several {resource} limits for "
-                    f"{where} ({hint})"
-                )
-            overrides[project][resource] = limit["resource_limit"]
+            if project := limit.get("project_id"):  # not a domain limit
+                overrides.setdefault(project, {})[resource] = limit["resource_limit"]
 
     return Quotas(
         default=Quota.from_limits(defaults),
@@ -142,13 +164,15 @@ def load_quotas(identity: Identity, service: str, region: str | None) -> Quotas:
     )
 
 
-def load_from_cloud() -> Quotas:
-    """Read the quotas, authenticating as OS_CLOUD (clouds.yaml) or OS_* say."""
+def load_from_cloud(endpoint_id: str | None) -> Quotas:
+    """Read the quotas, authenticating as OS_CLOUD (clouds.yaml) or OS_* say.
+
+    endpoint_id is RGW's endpoint in the Keystone catalog, or None.
+    """
     conn = openstack.connect()
     access = conn.session.auth.get_access(conn.session)
-    check_scope(access.system_scoped, access.role_names or [])
-    return load_quotas(
-        conn.identity,
-        service_id(access.service_catalog.catalog),
-        conn.config.region_name,
+    check_scope(access.system_scoped)
+    service, region = find_service(
+        access.service_catalog.catalog, endpoint_id, conn.config.region_name
     )
+    return load_quotas(conn.identity, service, region)

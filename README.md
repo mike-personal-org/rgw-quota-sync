@@ -48,23 +48,31 @@ openstack limit create --service object-store --project <project> \
 ```
 
 A project limit for one resource leaves the other at its default. Domain limits
-are ignored, and so is a hierarchical (`strict_two_level`) enforcement model:
-each project gets its own limit or the default.
+are ignored. With the hierarchical `strict_two_level` enforcement model, the
+tool logs a WARNING and still gives each project its own limit or the default,
+not a share of its parent's.
 
-If a cloud region is set (`region_name` in `clouds.yaml`, or `OS_REGION_NAME`),
-only that region's limits are read, as oslo.limit does, so create them with
-`--region`. Otherwise the tool reads limits of every region, and refuses to
-start if a project or registered limit exists for more than one.
+The tool reads the limits of one service and region, as oslo.limit does:
+
+- With `keystone_endpoint_id` in the config (RGW's endpoint in
+  `openstack endpoint list`), both come from that endpoint. Use this when the
+  catalog has more than one `object-store` service, e.g. Swift and RGW.
+- Otherwise the service is the catalog's only `object-store` service, and the
+  region is the cloud's (`region_name` in `clouds.yaml`, or `OS_REGION_NAME`).
+
+With a region, only limits created with `--region` for it are read. Without
+one, the tool reads every region's, and refuses to start if a registered limit
+exists for more than one.
 
 ## Credentials
 
 ### Keystone
 
 The tool authenticates like the `openstack` CLI: a `clouds.yaml` entry named by
-`OS_CLOUD`, or `OS_*` variables. Keystone only shows a token the limits of
-all projects if it is system scoped or has the `admin` or `service` role.
-Otherwise it silently leaves out other projects, so the tool refuses to run.
-Reading needs no more than the reader role on the system:
+`OS_CLOUD`, or `OS_*` variables. The token must be system scoped: for others,
+Keystone may silently leave out other projects' limits, so the tool refuses to
+run. Application credentials can't be system scoped. Reading needs no more than
+the reader role on the system:
 
 ```
 openstack role add --user quota-sync --user-domain Default --system all reader
@@ -102,6 +110,7 @@ For a custom CA, set `REQUESTS_CA_BUNDLE`.
 endpoint: https://rgw.example.org:8080  # Admin Ops API base URL, no path
 access_key: ...
 secret_key: ...
+keystone_endpoint_id: ...  # optional, see "Keystone limits"
 ```
 
 The tool refuses to start on an unknown key. Older versions read quotas from
@@ -160,8 +169,14 @@ that a dry run would change, that couldn't be read, or whose uid doesn't fit,
 count, so a dry run also works as a check.
 
 Every enabled quota that differs from Keystone is overwritten, including one
-set by hand with `radosgw-admin`. Before the first `--apply`, read a dry run's
-`would change` lines and create a project limit for any quota you mean to keep.
+set by hand with `radosgw-admin`, or through the Swift API by a reseller admin
+(`X-Account-Meta-Quota-Bytes` / `-Count`). Before the first `--apply`, read a
+dry run's `would change` lines and create a project limit for any quota you
+mean to keep.
+
+Each user's `check_on_raw` is kept as it is. When it is false, RGW's default,
+RGW counts every object rounded up to 4 KiB, so many small objects reach the
+quota before the bytes users see do. Swift counts raw bytes.
 
 ## Container
 
@@ -178,10 +193,10 @@ docker run --rm --user "$(id -u)" -e OS_CLOUD=quota-sync \
 
 ## API usage
 
-Keystone: `GET /v3/registered_limits` and `GET /v3/limits`, filtered by
+Keystone: `GET /v3/limits/model`, `GET /v3/registered_limits` and `GET /v3/limits`, filtered by
 `service_id`, `resource_name` and (if set) `region_id`, and `GET /v3/projects`,
-through openstacksdk's identity adapter. The `object-store` service ID comes
-from the token's catalog. Keystone can't page these lists. If it marks one
+through openstacksdk's identity adapter. The service ID (and with
+`keystone_endpoint_id`, the region) comes from the token's catalog. Keystone can't page these lists. If it marks one
 `truncated` (cut short by a `list_limit` option), the tool refuses to run
 rather than miss a limit or a project.
 
